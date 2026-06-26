@@ -13,7 +13,9 @@
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "lint": "eslint . --ext .ts,.tsx",
-    "test": "node --experimental-strip-types --no-warnings test/unlock.integration.ts"
+    "test": "node --experimental-strip-types --no-warnings test/unlock.integration.ts",
+    "dist:win": "npm run build && electron-builder --win --x64",
+    "dist:win:dir": "npm run build && electron-builder --win --x64 --dir"
   },
   "devDependencies": {
     "@types/d3-hierarchy": "^3.1.7",
@@ -25,6 +27,7 @@
     "@typescript-eslint/parser": "^8.62.0",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
     "eslint": "^8.57.1",
     "typescript": "^6.0.3",

@@ -1,0 +1,32 @@
+appId: com.aiprojects.spaceinvader
+productName: Space Invader
+copyright: Copyright © 2026 ai-projects
+
+directories:
+  output: release
+  buildResources: build
+
+# The renderer/main/preload are bundled by electron-vite into ./out first.
+files:
+  - out/**/*
+  - package.json
+
+# Don't auto-publish anywhere; we just want the local artifact.
+publish: null
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: SpaceInvader-${version}-Setup.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Space Invader
+  deleteAppDataOnUninstall: false
