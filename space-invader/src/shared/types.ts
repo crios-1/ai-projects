@@ -3,14 +3,26 @@ export interface FileNode {
   path: string
   /** Base name (last path segment). */
   name: string
-  /** Total size in bytes (recursive for directories). */
+  /** Apparent (logical) size in bytes (recursive for directories). */
   size: number
+  /** Allocated size on disk in bytes (block-rounded; recursive for dirs). */
+  allocSize: number
   /** True if this node is a directory. */
   isDirectory: boolean
   /** Last modified time as epoch milliseconds. */
   mtimeMs: number
+  /** Last access time as epoch milliseconds. */
+  atimeMs: number
   /** Child nodes (directories only). Undefined for files. */
   children?: FileNode[]
+}
+
+/** Which size metric to visualize / aggregate by. */
+export type SizeMetric = 'size' | 'allocSize'
+
+export interface ScanOptions {
+  /** When false (default), the scan does not descend into other filesystems. */
+  crossFilesystems?: boolean
 }
 
 export interface ScanProgress {
@@ -64,6 +76,10 @@ export interface DeleteResult {
   /** Set when deletion failed because the path was locked by a process. */
   locked?: boolean
   lockingProcesses?: LockingProcess[]
+  /** Set when deletion failed due to insufficient permissions. */
+  permissionDenied?: boolean
+  /** Set when the target is on the protected-path blocklist. */
+  protected?: boolean
   error?: string
 }
 
@@ -76,16 +92,78 @@ export interface UnlockResult {
 
 export type DeleteMode = 'trash' | 'permanent'
 
+export interface DuplicateGroup {
+  hash: string
+  /** Size in bytes of each file in the group. */
+  size: number
+  paths: string[]
+  /** Bytes that could be reclaimed by keeping a single copy. */
+  wastedBytes: number
+}
+
+export interface DuplicateResult {
+  groups: DuplicateGroup[]
+  /** Total reclaimable bytes across all groups. */
+  reclaimableBytes: number
+  filesHashed: number
+  durationMs: number
+  aborted: boolean
+}
+
+export interface DuplicateProgress {
+  phase: 'sizing' | 'hashing'
+  processed: number
+  total: number
+  currentPath: string
+}
+
+export interface TrashInfo {
+  supported: boolean
+  /** Primary trash location(s). */
+  locations: string[]
+  sizeBytes: number
+  itemCount: number
+}
+
+export interface EmptyTrashResult {
+  success: boolean
+  freedBytes: number
+  error?: string
+}
+
+export interface ReportPayload {
+  rootPath: string
+  totalBytes: number
+  scannedAt: string
+  largestFiles: { path: string; size: number }[]
+  byExtension: ExtensionStat[]
+  duplicates?: DuplicateGroup[]
+}
+
+export interface SaveReportResult {
+  success: boolean
+  path?: string
+  canceled?: boolean
+  error?: string
+}
+
 /** The API surface exposed to the renderer via the preload bridge. */
 export interface SpaceInvaderApi {
   listDrives: () => Promise<DriveInfo[]>
   pickDirectory: () => Promise<string | null>
-  scan: (rootPath: string) => Promise<ScanResult>
+  scan: (rootPath: string, options?: ScanOptions) => Promise<ScanResult>
   cancelScan: () => Promise<void>
   onScanProgress: (cb: (progress: ScanProgress) => void) => () => void
   deletePath: (path: string, mode: DeleteMode) => Promise<DeleteResult>
   findLockingProcesses: (path: string) => Promise<LockingProcess[]>
   unlockPath: (path: string) => Promise<UnlockResult>
   revealInFolder: (path: string) => Promise<void>
+  copyToClipboard: (text: string) => Promise<void>
   getHomeDir: () => Promise<string>
+  findDuplicates: (rootPath: string, minSize: number) => Promise<DuplicateResult>
+  cancelDuplicates: () => Promise<void>
+  onDuplicateProgress: (cb: (p: DuplicateProgress) => void) => () => void
+  getTrashInfo: () => Promise<TrashInfo>
+  emptyTrash: () => Promise<EmptyTrashResult>
+  saveReport: (payload: ReportPayload, format: 'json' | 'csv') => Promise<SaveReportResult>
 }

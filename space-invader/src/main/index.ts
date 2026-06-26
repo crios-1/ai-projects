@@ -1,18 +1,35 @@
-import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
+import {
+  app,
+  shell,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  clipboard
+} from 'electron'
 import { join } from 'path'
 import { homedir } from 'os'
-import { DiskScanner } from './scanner'
+import { promises as fs } from 'fs'
+import { Worker } from 'worker_threads'
+import { DuplicateFinder } from './duplicates'
 import {
   listDrives,
   deletePath,
   findLockingProcesses,
   unlockPath,
-  revealInFolder
+  revealInFolder,
+  getTrashInfo,
+  emptyTrash
 } from './fileops'
-import type { DeleteMode, ScanProgress } from '../shared/types'
+import type {
+  DeleteMode,
+  ScanOptions,
+  ScanResult,
+  ReportPayload
+} from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
-let activeScanner: DiskScanner | null = null
+let activeScanWorker: Worker | null = null
+let activeDuplicateFinder: DuplicateFinder | null = null
 
 // On Linux the Chromium sandbox requires a correctly configured setuid helper,
 // which is frequently unavailable in headless / containerized environments.
@@ -23,10 +40,10 @@ if (process.platform === 'linux') {
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
-    minWidth: 940,
-    minHeight: 640,
+    width: 1320,
+    height: 860,
+    minWidth: 980,
+    minHeight: 660,
     show: false,
     backgroundColor: '#0a0a16',
     title: 'Space Invader',
@@ -55,6 +72,34 @@ function createWindow(): void {
   }
 }
 
+/** Runs a disk scan in a worker thread so the main process stays responsive. */
+function runScan(
+  rootPath: string,
+  options: ScanOptions,
+  onProgress: (p: unknown) => void
+): Promise<ScanResult> {
+  return new Promise((resolvePromise, reject) => {
+    const worker = new Worker(join(__dirname, 'scan-worker.js'), {
+      workerData: { rootPath, options }
+    })
+    activeScanWorker = worker
+
+    worker.on('message', (msg: any) => {
+      if (msg?.type === 'progress') {
+        onProgress(msg.progress)
+      } else if (msg?.type === 'result') {
+        resolvePromise(msg.result as ScanResult)
+      } else if (msg?.type === 'error') {
+        reject(new Error(msg.error))
+      }
+    })
+    worker.on('error', reject)
+    worker.on('exit', () => {
+      if (activeScanWorker === worker) activeScanWorker = null
+    })
+  })
+}
+
 function registerIpc(): void {
   ipcMain.handle('drives:list', () => listDrives())
 
@@ -68,21 +113,41 @@ function registerIpc(): void {
     return result.filePaths[0]
   })
 
-  ipcMain.handle('scan:start', async (event, rootPath: string) => {
-    activeScanner?.abort()
-    const scanner = new DiskScanner((progress: ScanProgress) => {
-      if (!event.sender.isDestroyed()) {
-        event.sender.send('scan:progress', progress)
-      }
-    })
-    activeScanner = scanner
-    const result = await scanner.scan(rootPath)
-    if (activeScanner === scanner) activeScanner = null
-    return result
-  })
+  ipcMain.handle(
+    'scan:start',
+    async (event, rootPath: string, options: ScanOptions = {}) => {
+      activeScanWorker?.postMessage({ type: 'abort' })
+      const result = await runScan(rootPath, options, (progress) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('scan:progress', progress)
+        }
+      })
+      return result
+    }
+  )
 
   ipcMain.handle('scan:cancel', () => {
-    activeScanner?.abort()
+    activeScanWorker?.postMessage({ type: 'abort' })
+  })
+
+  ipcMain.handle(
+    'dup:find',
+    async (event, rootPath: string, minSize: number) => {
+      activeDuplicateFinder?.abort()
+      const finder = new DuplicateFinder((p) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('dup:progress', p)
+        }
+      })
+      activeDuplicateFinder = finder
+      const result = await finder.find(rootPath, minSize)
+      if (activeDuplicateFinder === finder) activeDuplicateFinder = null
+      return result
+    }
+  )
+
+  ipcMain.handle('dup:cancel', () => {
+    activeDuplicateFinder?.abort()
   })
 
   ipcMain.handle('fs:delete', (_e, path: string, mode: DeleteMode) =>
@@ -97,7 +162,77 @@ function registerIpc(): void {
 
   ipcMain.handle('fs:reveal', (_e, path: string) => revealInFolder(path))
 
+  ipcMain.handle('clipboard:write', (_e, text: string) => {
+    clipboard.writeText(text)
+  })
+
+  ipcMain.handle('trash:info', () => getTrashInfo())
+
+  ipcMain.handle('trash:empty', () => emptyTrash())
+
   ipcMain.handle('env:home', () => homedir())
+
+  ipcMain.handle(
+    'report:save',
+    async (_e, payload: ReportPayload, format: 'json' | 'csv') => {
+      if (!mainWindow) return { success: false, error: 'No window' }
+      const defaultName = `space-invader-report.${format}`
+      const dlg = await dialog.showSaveDialog(mainWindow, {
+        title: 'Save disk report',
+        defaultPath: defaultName,
+        filters: [
+          {
+            name: format.toUpperCase(),
+            extensions: [format]
+          }
+        ]
+      })
+      if (dlg.canceled || !dlg.filePath) {
+        return { success: false, canceled: true }
+      }
+      try {
+        const content =
+          format === 'json' ? toJsonReport(payload) : toCsvReport(payload)
+        await fs.writeFile(dlg.filePath, content, 'utf8')
+        return { success: true, path: dlg.filePath }
+      } catch (err: any) {
+        return { success: false, error: err?.message ?? String(err) }
+      }
+    }
+  )
+}
+
+function toJsonReport(payload: ReportPayload): string {
+  return JSON.stringify(payload, null, 2)
+}
+
+function toCsvReport(payload: ReportPayload): string {
+  const lines: string[] = []
+  lines.push(`Space Invader report,${payload.rootPath}`)
+  lines.push(`Scanned at,${payload.scannedAt}`)
+  lines.push(`Total bytes,${payload.totalBytes}`)
+  lines.push('')
+  lines.push('Largest files')
+  lines.push('size_bytes,path')
+  for (const f of payload.largestFiles) {
+    lines.push(`${f.size},"${f.path.replace(/"/g, '""')}"`)
+  }
+  lines.push('')
+  lines.push('By extension')
+  lines.push('extension,size_bytes,count')
+  for (const e of payload.byExtension) {
+    lines.push(`${e.extension},${e.size},${e.count}`)
+  }
+  if (payload.duplicates?.length) {
+    lines.push('')
+    lines.push('Duplicate groups')
+    lines.push('size_bytes,wasted_bytes,copies,paths')
+    for (const g of payload.duplicates) {
+      const paths = g.paths.map((p) => p.replace(/"/g, '""')).join(' | ')
+      lines.push(`${g.size},${g.wastedBytes},${g.paths.length},"${paths}"`)
+    }
+  }
+  return lines.join('\n')
 }
 
 app.whenReady().then(() => {

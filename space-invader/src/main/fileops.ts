@@ -2,16 +2,56 @@ import { promises as fs } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir, platform, userInfo } from 'os'
+import { resolve, join, sep } from 'path'
 import type {
   DriveInfo,
   LockingProcess,
   DeleteResult,
   UnlockResult,
-  DeleteMode
+  DeleteMode,
+  TrashInfo,
+  EmptyTrashResult
 } from '../shared/types'
 
 const execFileAsync = promisify(execFile)
 const LSOF_TIMEOUT_MS = 8000
+
+/**
+ * Paths that must never be deleted: filesystem roots, the user's home, and
+ * critical system directories. Deleting these would damage the OS or the user
+ * account, so they are rejected before any delete is attempted.
+ */
+export function isProtectedPath(targetPath: string): boolean {
+  const p = resolve(targetPath).replace(/[/\\]+$/, '') || sep
+  const home = resolve(homedir())
+
+  if (p === sep || /^[a-zA-Z]:\\?$/.test(p)) return true
+  if (p === home) return true
+
+  const roots =
+    platform() === 'win32'
+      ? ['C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)']
+      : [
+          '/bin',
+          '/sbin',
+          '/usr',
+          '/lib',
+          '/lib64',
+          '/etc',
+          '/boot',
+          '/dev',
+          '/proc',
+          '/sys',
+          '/var',
+          '/System',
+          '/Library',
+          '/Applications',
+          '/private',
+          '/home',
+          '/Users'
+        ]
+  return roots.some((r) => p === r)
+}
 
 /**
  * Lists logical drives / mount points along with capacity information.
@@ -92,8 +132,7 @@ export async function findLockingProcesses(
   targetPath: string
 ): Promise<LockingProcess[]> {
   if (platform() === 'win32') {
-    // Lock discovery on Windows would require handle.exe / RestartManager.
-    return []
+    return findLockingProcessesWindows(targetPath)
   }
 
   let isDir = false
@@ -120,6 +159,39 @@ export async function findLockingProcesses(
   }
 
   return parseLsof(stdout)
+}
+
+/**
+ * Windows lock discovery via Sysinternals `handle.exe` if it is available on
+ * PATH. handle.exe is not bundled (its EULA forbids redistribution), so this
+ * returns an empty list when the tool is absent.
+ */
+async function findLockingProcessesWindows(
+  targetPath: string
+): Promise<LockingProcess[]> {
+  let stdout = ''
+  try {
+    const res = await execFileAsync('handle.exe', ['-nobanner', targetPath], {
+      timeout: LSOF_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024 * 16
+    })
+    stdout = res.stdout
+  } catch (err: any) {
+    stdout = err?.stdout ?? ''
+  }
+
+  // Lines look like: "node.exe           pid: 1234   type: File          ..."
+  const byPid = new Map<number, LockingProcess>()
+  const re = /^(\S+)\s+pid:\s*(\d+)/i
+  for (const line of stdout.split(/\r?\n/)) {
+    const m = re.exec(line.trim())
+    if (!m) continue
+    const pid = Number(m[2])
+    if (pid > 0 && !byPid.has(pid)) {
+      byPid.set(pid, { pid, command: m[1], user: '' })
+    }
+  }
+  return [...byPid.values()].sort((a, b) => a.pid - b.pid)
 }
 
 /**
@@ -168,6 +240,16 @@ export async function deletePath(
   targetPath: string,
   mode: DeleteMode
 ): Promise<DeleteResult> {
+  if (isProtectedPath(targetPath)) {
+    return {
+      success: false,
+      path: targetPath,
+      freedBytes: 0,
+      protected: true,
+      error: 'This path is protected and cannot be deleted.'
+    }
+  }
+
   let freedBytes = 0
   try {
     freedBytes = await pathSize(targetPath)
@@ -203,6 +285,16 @@ export async function deletePath(
         locked: true,
         lockingProcesses: locking,
         error: 'Path is locked by one or more running processes.'
+      }
+    }
+    const code = err?.code
+    if (code === 'EACCES' || code === 'EPERM') {
+      return {
+        success: false,
+        path: targetPath,
+        freedBytes: 0,
+        permissionDenied: true,
+        error: `Permission denied. Try running Space Invader with elevated privileges (current user: ${currentUser()}).`
       }
     }
     return {
@@ -273,6 +365,90 @@ export async function unlockPath(targetPath: string): Promise<UnlockResult> {
 export async function revealInFolder(targetPath: string): Promise<void> {
   const { shell } = await import('electron')
   shell.showItemInFolder(targetPath)
+}
+
+/**
+ * Returns the location and aggregate size of the user's Trash. Implemented for
+ * the freedesktop.org trash (Linux) and macOS `~/.Trash`. On Windows the
+ * Recycle Bin is not enumerable without extra APIs, so it reports unsupported.
+ */
+export async function getTrashInfo(): Promise<TrashInfo> {
+  const locations = trashLocations()
+  if (locations.length === 0) {
+    return { supported: false, locations: [], sizeBytes: 0, itemCount: 0 }
+  }
+
+  let sizeBytes = 0
+  let itemCount = 0
+  for (const dir of locations) {
+    try {
+      const entries = await fs.readdir(dir)
+      itemCount += entries.length
+      for (const name of entries) {
+        try {
+          sizeBytes += await pathSize(join(dir, name))
+        } catch {
+          // skip unreadable item
+        }
+      }
+    } catch {
+      // trash dir does not exist yet
+    }
+  }
+  return { supported: true, locations, sizeBytes, itemCount }
+}
+
+export async function emptyTrash(): Promise<EmptyTrashResult> {
+  const info = await getTrashInfo()
+  if (!info.supported) {
+    return {
+      success: false,
+      freedBytes: 0,
+      error: 'Emptying the trash is not supported on this platform.'
+    }
+  }
+
+  const dirs =
+    platform() === 'darwin'
+      ? info.locations
+      : info.locations.flatMap((d) => [d, d.replace(/\/files$/, '/info')])
+
+  try {
+    for (const dir of dirs) {
+      let entries: string[] = []
+      try {
+        entries = await fs.readdir(dir)
+      } catch {
+        continue
+      }
+      for (const name of entries) {
+        await fs.rm(join(dir, name), { recursive: true, force: true })
+      }
+    }
+    return { success: true, freedBytes: info.sizeBytes }
+  } catch (err: any) {
+    return {
+      success: false,
+      freedBytes: 0,
+      error: err?.message ?? String(err)
+    }
+  }
+}
+
+/** Returns the directories whose contents constitute the user's trash. */
+function trashLocations(): string[] {
+  const home = homedir()
+  if (platform() === 'darwin') {
+    return [join(home, '.Trash')]
+  }
+  if (platform() === 'win32') {
+    return []
+  }
+  const dataHome =
+    process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim()
+      ? process.env.XDG_DATA_HOME
+      : join(home, '.local', 'share')
+  return [join(dataHome, 'Trash', 'files')]
 }
 
 async function pathSize(targetPath: string): Promise<number> {

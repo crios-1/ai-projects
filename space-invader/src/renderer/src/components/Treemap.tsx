@@ -4,16 +4,18 @@ import {
   treemap,
   type HierarchyRectangularNode
 } from 'd3-hierarchy'
-import type { FileNode } from '../../../shared/types'
+import type { FileNode, SizeMetric } from '../../../shared/types'
 import { formatBytes, colorForKey } from '../format'
 
 interface TreemapProps {
   root: FileNode
   width: number
   height: number
+  metric: SizeMetric
   selectedPath: string | null
   onSelect: (node: FileNode) => void
   onDrill: (node: FileNode) => void
+  onContextMenu?: (node: FileNode, x: number, y: number) => void
 }
 
 const MAX_RENDER_DEPTH = 2
@@ -39,9 +41,11 @@ export function Treemap({
   root,
   width,
   height,
+  metric,
   selectedPath,
   onSelect,
-  onDrill
+  onDrill,
+  onContextMenu
 }: TreemapProps): React.JSX.Element {
   const [hover, setHover] = useState<{
     node: FileNode
@@ -53,7 +57,9 @@ export function Treemap({
   const nodes = useMemo(() => {
     const trimmed = trimTree(root, 0, MAX_RENDER_DEPTH)
     const h = hierarchy(trimmed, (d) => d.children)
-      .sum((d) => (d.children && d.children.length ? 0 : Math.max(d.size, 0)))
+      .sum((d) =>
+        d.children && d.children.length ? 0 : Math.max(d[metric], 0)
+      )
       .sort((a, b) => (b.value ?? 0) - (a.value ?? 0))
 
     const laidOut = treemap<FileNode>()
@@ -64,7 +70,7 @@ export function Treemap({
       .round(true)(h)
 
     return laidOut.descendants().filter((d) => d.depth > 0)
-  }, [root, width, height])
+  }, [root, width, height, metric])
 
   if (width <= 0 || height <= 0) return <div className="treemap-empty" />
 
@@ -84,9 +90,11 @@ export function Treemap({
           <Tile
             key={d.data.path + d.depth}
             node={d}
+            metric={metric}
             selected={d.data.path === selectedPath}
             onSelect={onSelect}
             onDrill={onDrill}
+            onContextMenu={onContextMenu}
             onHover={(node, evt) => {
               const rect = containerRef.current?.getBoundingClientRect()
               setHover({
@@ -105,7 +113,7 @@ export function Treemap({
           style={{ left: hover.x + 14, top: hover.y + 14 }}
         >
           <strong>{hover.node.name}</strong>
-          <span>{formatBytes(hover.node.size)}</span>
+          <span>{formatBytes(hover.node[metric])}</span>
           {hover.node.isDirectory && <em>Double-click to open</em>}
         </div>
       )}
@@ -115,18 +123,22 @@ export function Treemap({
 
 interface TileProps {
   node: HierarchyRectangularNode<FileNode>
+  metric: SizeMetric
   selected: boolean
   onSelect: (node: FileNode) => void
   onDrill: (node: FileNode) => void
+  onContextMenu?: (node: FileNode, x: number, y: number) => void
   onHover: (node: FileNode, evt: React.MouseEvent) => void
   onLeave: () => void
 }
 
 function Tile({
   node,
+  metric,
   selected,
   onSelect,
   onDrill,
+  onContextMenu,
   onHover,
   onLeave
 }: TileProps): React.JSX.Element | null {
@@ -160,6 +172,11 @@ function Tile({
           onDrill(ancestor.data)
         }
       }}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        onContextMenu?.(node.data, e.clientX, e.clientY)
+      }}
     >
       <rect
         width={w}
@@ -181,11 +198,11 @@ function Tile({
         >
           <tspan className="tile-name">
             {node.data.name}
-            {isGroup ? `  ·  ${formatBytes(node.data.size)}` : ''}
+            {isGroup ? `  ·  ${formatBytes(node.data[metric])}` : ''}
           </tspan>
           {!isGroup && h > 34 && (
             <tspan x={6} dy={14} className="tile-size">
-              {formatBytes(node.data.size)}
+              {formatBytes(node.data[metric])}
             </tspan>
           )}
         </text>

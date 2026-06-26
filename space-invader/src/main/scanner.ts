@@ -4,6 +4,7 @@ import type {
   FileNode,
   ScanResult,
   ScanProgress,
+  ScanOptions,
   ExtensionStat
 } from '../shared/types'
 
@@ -11,20 +12,24 @@ const LARGEST_FILES_LIMIT = 500
 const PROGRESS_THROTTLE_MS = 120
 
 /**
- * Recursively scans a directory tree, computing aggregate sizes, the largest
- * individual files, and a per-extension breakdown. Designed to be resilient:
- * unreadable entries (permissions, broken symlinks, races) are skipped rather
- * than aborting the whole scan.
+ * Recursively scans a directory tree, computing aggregate sizes (both apparent
+ * and on-disk), the largest individual files, and a per-extension breakdown.
+ * Designed to be resilient: unreadable entries (permissions, broken symlinks,
+ * races) are skipped rather than aborting the whole scan.
  */
 export class DiskScanner {
   private aborted = false
   private scanned = 0
   private totalBytes = 0
   private lastProgressAt = 0
+  private rootDev = -1
   private readonly largest: FileNode[] = []
   private readonly extensions = new Map<string, ExtensionStat>()
 
-  constructor(private readonly onProgress: (p: ScanProgress) => void) {}
+  constructor(
+    private readonly onProgress: (p: ScanProgress) => void,
+    private readonly options: ScanOptions = {}
+  ) {}
 
   abort(): void {
     this.aborted = true
@@ -32,8 +37,13 @@ export class DiskScanner {
 
   async scan(rootPath: string): Promise<ScanResult> {
     const start = Date.now()
+    try {
+      this.rootDev = (await fs.lstat(rootPath)).dev
+    } catch {
+      this.rootDev = -1
+    }
     const root = await this.walk(rootPath)
-    this.emitProgress(rootPath, true)
+    this.emitProgress(rootPath)
 
     const byExtension = [...this.extensions.values()].sort(
       (a, b) => b.size - a.size
@@ -54,22 +64,32 @@ export class DiskScanner {
     try {
       stat = await fs.lstat(currentPath)
     } catch {
-      return this.makeNode(currentPath, 0, false, 0)
+      return this.makeNode(currentPath, 0, 0, false, 0, 0)
     }
 
     this.scanned += 1
+    const alloc = stat.blocks * 512
 
     // Never follow symlinks: avoids cycles and double-counting.
     if (stat.isSymbolicLink()) {
-      return this.makeNode(currentPath, stat.size, false, stat.mtimeMs)
+      return this.makeNode(
+        currentPath,
+        stat.size,
+        alloc,
+        false,
+        stat.mtimeMs,
+        stat.atimeMs
+      )
     }
 
     if (!stat.isDirectory()) {
       const node = this.makeNode(
         currentPath,
         stat.size,
+        alloc,
         false,
-        stat.mtimeMs
+        stat.mtimeMs,
+        stat.atimeMs
       )
       this.totalBytes += stat.size
       this.recordExtension(currentPath, stat.size)
@@ -78,7 +98,30 @@ export class DiskScanner {
       return node
     }
 
-    const node = this.makeNode(currentPath, 0, true, stat.mtimeMs)
+    // Do not descend into other filesystems unless explicitly requested.
+    if (
+      !this.options.crossFilesystems &&
+      this.rootDev >= 0 &&
+      stat.dev !== this.rootDev
+    ) {
+      return this.makeNode(
+        currentPath,
+        0,
+        alloc,
+        true,
+        stat.mtimeMs,
+        stat.atimeMs
+      )
+    }
+
+    const node = this.makeNode(
+      currentPath,
+      0,
+      alloc,
+      true,
+      stat.mtimeMs,
+      stat.atimeMs
+    )
     node.children = []
     this.maybeEmitProgress(currentPath)
 
@@ -95,6 +138,7 @@ export class DiskScanner {
       const child = await this.walk(childPath)
       node.children.push(child)
       node.size += child.size
+      node.allocSize += child.allocSize
     }
 
     return node
@@ -103,15 +147,19 @@ export class DiskScanner {
   private makeNode(
     path: string,
     size: number,
+    allocSize: number,
     isDirectory: boolean,
-    mtimeMs: number
+    mtimeMs: number,
+    atimeMs: number
   ): FileNode {
     return {
       path,
       name: basename(path),
       size,
+      allocSize,
       isDirectory,
-      mtimeMs
+      mtimeMs,
+      atimeMs
     }
   }
 
@@ -131,7 +179,6 @@ export class DiskScanner {
       this.largest.push(node)
       return
     }
-    // Replace the current smallest if this file is bigger.
     let minIdx = 0
     for (let i = 1; i < this.largest.length; i++) {
       if (this.largest[i].size < this.largest[minIdx].size) minIdx = i
@@ -145,11 +192,11 @@ export class DiskScanner {
     const now = Date.now()
     if (now - this.lastProgressAt >= PROGRESS_THROTTLE_MS) {
       this.lastProgressAt = now
-      this.emitProgress(currentPath, false)
+      this.emitProgress(currentPath)
     }
   }
 
-  private emitProgress(currentPath: string, _final: boolean): void {
+  private emitProgress(currentPath: string): void {
     this.onProgress({
       currentPath,
       scanned: this.scanned,
