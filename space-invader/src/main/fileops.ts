@@ -2,7 +2,6 @@ import { promises as fs } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir, platform, userInfo } from 'os'
-import { shell } from 'electron'
 import type {
   DriveInfo,
   LockingProcess,
@@ -105,8 +104,8 @@ export async function findLockingProcesses(
   }
 
   const args = isDir
-    ? ['-w', '-F', 'pcuLn', '+D', targetPath]
-    : ['-w', '-F', 'pcuLn', '--', targetPath]
+    ? ['-w', '-F', 'pcL', '+D', targetPath]
+    : ['-w', '-F', 'pcL', '--', targetPath]
 
   let stdout = ''
   try {
@@ -124,8 +123,9 @@ export async function findLockingProcesses(
 }
 
 /**
- * Parses `lsof -F pcuLn` machine-readable output. Each record is a set of
- * lines prefixed by a field type character (p=pid, c=command, L=login/user).
+ * Parses `lsof -F pcL` machine-readable output. Output is a sequence of
+ * per-process blocks: a `p<pid>` line followed by `c<command>` and `L<login>`
+ * lines. A new `p` line (or end of output) flushes the current process.
  */
 function parseLsof(stdout: string): LockingProcess[] {
   const byPid = new Map<number, LockingProcess>()
@@ -133,11 +133,18 @@ function parseLsof(stdout: string): LockingProcess[] {
   let command = ''
   let user = ''
 
+  const flush = (): void => {
+    if (pid > 0 && !byPid.has(pid)) {
+      byPid.set(pid, { pid, command, user })
+    }
+  }
+
   for (const line of stdout.split('\n')) {
     if (!line) continue
     const type = line[0]
     const value = line.slice(1)
     if (type === 'p') {
+      flush()
       pid = Number(value)
       command = ''
       user = ''
@@ -145,13 +152,9 @@ function parseLsof(stdout: string): LockingProcess[] {
       command = value
     } else if (type === 'L') {
       user = value
-    } else if (type === 'f') {
-      // First file descriptor record for this pid: commit the process entry.
-      if (pid && !byPid.has(pid)) {
-        byPid.set(pid, { pid, command, user })
-      }
     }
   }
+  flush()
 
   return [...byPid.values()].sort((a, b) => a.pid - b.pid)
 }
@@ -174,6 +177,7 @@ export async function deletePath(
 
   if (mode === 'trash') {
     try {
+      const { shell } = await import('electron')
       await shell.trashItem(targetPath)
       return { success: true, path: targetPath, freedBytes }
     } catch (err: any) {
@@ -267,6 +271,7 @@ export async function unlockPath(targetPath: string): Promise<UnlockResult> {
 }
 
 export async function revealInFolder(targetPath: string): Promise<void> {
+  const { shell } = await import('electron')
   shell.showItemInFolder(targetPath)
 }
 

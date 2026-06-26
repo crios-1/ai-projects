@@ -58,7 +58,8 @@ export function Treemap({
 
     const laidOut = treemap<FileNode>()
       .size([width, height])
-      .paddingTop((d) => (d.depth === 0 && d.children ? 22 : 0))
+      // A header strip on each top-level folder doubles as a drill handle.
+      .paddingTop((d) => (d.depth === 1 && d.children?.length ? 20 : 0))
       .paddingInner(2)
       .round(true)(h)
 
@@ -151,7 +152,13 @@ function Tile({
       }}
       onDoubleClick={(e) => {
         e.stopPropagation()
-        if (node.data.isDirectory) onDrill(node.data)
+        // Drill into a folder directly, or into a file's parent folder so the
+        // whole nested area acts as a zoom-in handle.
+        if (node.data.isDirectory) {
+          onDrill(node.data)
+        } else if (ancestor?.data.isDirectory) {
+          onDrill(ancestor.data)
+        }
       }}
     >
       <rect
@@ -172,8 +179,11 @@ function Tile({
           className="tile-label"
           clipPath="inset(0)"
         >
-          <tspan className="tile-name">{node.data.name}</tspan>
-          {h > 34 && (
+          <tspan className="tile-name">
+            {node.data.name}
+            {isGroup ? `  ·  ${formatBytes(node.data.size)}` : ''}
+          </tspan>
+          {!isGroup && h > 34 && (
             <tspan x={6} dy={14} className="tile-size">
               {formatBytes(node.data.size)}
             </tspan>

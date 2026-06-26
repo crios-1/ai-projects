@@ -14,6 +14,13 @@ import type { DeleteMode, ScanProgress } from '../shared/types'
 let mainWindow: BrowserWindow | null = null
 let activeScanner: DiskScanner | null = null
 
+// On Linux the Chromium sandbox requires a correctly configured setuid helper,
+// which is frequently unavailable in headless / containerized environments.
+// Disable it there so the app can launch reliably.
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('no-sandbox')
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1280,
